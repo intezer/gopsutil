@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/host"
@@ -28,8 +29,9 @@ var (
 )
 
 const (
-	PrioProcess = 0   // linux/resource.h
-	ClockTicks  = 100 // C.sysconf(C._SC_CLK_TCK)
+	PrioProcess      = 0   // linux/resource.h
+	ClockTicks       = 100 // C.sysconf(C._SC_CLK_TCK)
+	deletedMapSuffix = " (deleted)"
 )
 
 // MemoryInfoExStat is different between OSes
@@ -50,6 +52,7 @@ func (m MemoryInfoExStat) String() string {
 
 type MemoryMapsStat struct {
 	Path         string `json:"path"`
+	OnDisk       bool   `json:"onDisk"`
 	Rss          uint64 `json:"rss"`
 	Size         uint64 `json:"size"`
 	Pss          uint64 `json:"pss"`
@@ -60,6 +63,12 @@ type MemoryMapsStat struct {
 	Referenced   uint64 `json:"referenced"`
 	Anonymous    uint64 `json:"anonymous"`
 	Swap         uint64 `json:"swap"`
+	StartAddress uint64 `json:"startAddress"`
+	EndAddress   uint64 `json:"endAddress"`
+	Permissions  string `json:"permissions"`
+	Offset       uint64 `json:"offset"`
+	Device       string `json:"device"`
+	Inode        uint64 `json:"inode"`
 }
 
 // String returns JSON value of the process.
@@ -409,10 +418,59 @@ func (p *Process) MemoryMaps(grouped bool) (*[]MemoryMapsStat, error) {
 	lines := strings.Split(string(contents), "\n")
 
 	// function of parsing a block
-	getBlock := func(first_line []string, block []string) (MemoryMapsStat, error) {
+	getBlock := func(firstLine []string, block []string) (MemoryMapsStat, error) {
 		m := MemoryMapsStat{}
-		m.Path = first_line[len(first_line)-1]
 
+		addresses := strings.Split(firstLine[0], "-")
+		m.StartAddress, err = strconv.ParseUint(addresses[0], 16, 64)
+		if err != nil {
+			return m, err
+		}
+
+		m.EndAddress, err = strconv.ParseUint(addresses[1], 16, 64)
+		if err != nil {
+			return m, err
+		}
+
+		m.Permissions = firstLine[1]
+		m.Offset, err = strconv.ParseUint(firstLine[2], 16, 64)
+		if err != nil {
+			return m, err
+		}
+
+		m.Device = firstLine[3]
+
+		m.Inode, err = strconv.ParseUint(firstLine[4], 10, 64)
+		if err != nil {
+			return m, err
+		}
+
+		path := firstLine[len(firstLine)-1]
+		// The file-backed memory might be deleted or can have the suffix "(deleted)" in its name
+		if strings.HasSuffix(path, deletedMapSuffix) {
+			// The file might contain the the string (deleted) - check if the (deleted) is there because the file was deleted
+			var stat syscall.Stat_t
+			err = syscall.Stat(path, &stat)
+			if err != nil {
+				// Note that we only checking for existence, the error might be permission related and in that case,
+				// we can't determine the cause of the deleted suffix
+				if os.IsNotExist(err) {
+					path = strings.Replace(path, deletedMapSuffix, "", 1)
+				}
+			} else if stat.Ino != m.Inode {
+				// Different file with the suffix (deleted) might exists, compare the inodes to make sure it's the same file
+				path = strings.Replace(path, deletedMapSuffix, "", 1)
+			} else {
+				m.OnDisk = true
+			}
+		} else if m.Inode != 0 {
+			// Not anonymous memory, not const map (like stack) and the path exists according to smaps output
+			m.OnDisk = true
+		}
+
+		m.Path = path
+
+		var t uint64
 		for _, line := range block {
 			if strings.Contains(line, "VmFlags") {
 				continue
@@ -422,7 +480,7 @@ func (p *Process) MemoryMaps(grouped bool) (*[]MemoryMapsStat, error) {
 				continue
 			}
 			v := strings.Trim(field[1], " kB") // remove last "kB"
-			t, err := strconv.ParseUint(v, 10, 64)
+			t, err = strconv.ParseUint(v, 10, 64)
 			if err != nil {
 				return m, err
 			}
@@ -455,10 +513,15 @@ func (p *Process) MemoryMaps(grouped bool) (*[]MemoryMapsStat, error) {
 
 	blocks := make([]string, 16)
 	for _, line := range lines {
-		field := strings.Split(line, " ")
+		if len(line) == 0 {
+			continue
+		}
+
+		field := strings.SplitN(line, " ", 6)
 		if strings.HasSuffix(field[0], ":") == false {
 			// new block section
 			if len(blocks) > 0 {
+				field[len(field)-1] = strings.TrimLeft(field[len(field)-1], " ")
 				g, err := getBlock(field, blocks)
 				if err != nil {
 					return &ret, err
@@ -607,8 +670,7 @@ func (p *Process) fillFromfd() (int32, []*OpenFilesStat, error) {
 
 	var openfiles []*OpenFilesStat
 	for _, fd := range fnames {
-		fpath := filepath.Join(statPath, fd)
-		filepath, err := os.Readlink(fpath)
+		filePath, err := os.Readlink(filepath.Join(statPath, fd))
 		if err != nil {
 			continue
 		}
@@ -617,7 +679,7 @@ func (p *Process) fillFromfd() (int32, []*OpenFilesStat, error) {
 			return numFDs, openfiles, err
 		}
 		o := &OpenFilesStat{
-			Path: filepath,
+			Path: filePath,
 			Fd:   t,
 		}
 		openfiles = append(openfiles, o)
@@ -995,7 +1057,7 @@ func (p *Process) fillFromTIDStat(tid int32) (string, int32, *cpu.TimesStat, int
 
 	rtpriority, err := strconv.ParseInt(fields[i+16], 10, 32)
 	if rtpriority < 0 {
-		rtpriority = rtpriority*-1 - 1
+		rtpriority = rtpriority * -1 - 1
 	} else {
 		rtpriority = 0
 	}
